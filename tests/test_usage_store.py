@@ -11,6 +11,7 @@ from claude_swap.usage_store import (
     BACKOFF_BASE_S,
     BACKOFF_CAP_S,
     CLAIM_TTL_S,
+    HISTORY_KEEP_S,
     RATE_LIMIT_TRUST_MAX_AGE_S,
     SERVE_TTL_S,
     STALE_OK_S,
@@ -1845,3 +1846,97 @@ class TestAdopt:
         store.adopt({"2": (USAGE, 0.0)}, IDENT)
         row = json.loads(store.path.read_text(encoding="utf-8"))["accounts"]["2"]
         assert (row["email"], row["organizationUuid"]) == IDENT["2"]
+
+
+def _history_samples(store, num: str = "1") -> list:
+    raw = json.loads(store.history_path.read_text(encoding="utf-8"))
+    assert raw["schemaVersion"] == 1
+    return raw["accounts"][num]["samples"]
+
+
+class TestUsageHistory:
+    FULL = {
+        "five_hour": {"pct": 25.0},
+        "seven_day": {"pct": 10.0},
+        "scoped": [{"name": "Fable", "pct": 40.0}],
+        "spend": {"pct": 5.0, "used": 1.0, "limit": 20.0},
+    }
+
+    def test_history_appends_on_success(self, store, clock):
+        store.record({"1": FetchRecord(usage=self.FULL)}, IDENT)
+        clock.advance(60)
+        store.record({"1": FetchRecord(usage={"five_hour": {"pct": 30.0}})}, IDENT)
+        raw = json.loads(store.history_path.read_text(encoding="utf-8"))
+        slot = raw["accounts"]["1"]
+        assert (slot["email"], slot["organizationUuid"]) == IDENT["1"]
+        assert slot["samples"] == [
+            [clock.now - 60, {"five_hour": 25.0, "seven_day": 10.0, "Fable": 40.0}],
+            [clock.now, {"five_hour": 30.0}],
+        ]
+
+    def test_history_skips_failures_and_sentinels(self, store, clock):
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        store.record({"1": FetchRecord(sentinel="token expired")}, IDENT)
+        store.record({"1": FetchRecord(usage=None)}, IDENT)  # success, no window data
+        assert not store.history_path.exists()
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(60)
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        # a fenced writer whose lease is gone is not accepted: no sample either
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT, claims={"1": "stale"})
+        assert len(_history_samples(store)) == 1
+
+    def test_history_prunes_older_than_keep(self, store, clock):
+        first = clock.now
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(HISTORY_KEEP_S - 1)
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(2)  # the first sample is now older than the keep window
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        times = [t for t, _sample in _history_samples(store)]
+        assert first not in times
+        assert times == [clock.now - 2, clock.now]
+
+    def test_history_dedupes_same_timestamp(self, store, clock):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.record({"1": FetchRecord(usage={"five_hour": {"pct": 99.0}})}, IDENT)
+        assert _history_samples(store) == [
+            [clock.now, {"five_hour": 25.0, "seven_day": 10.0}]
+        ]
+
+    def test_history_resets_on_identity_change(self, store, clock):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(60)
+        other = {"1": ("new@x.com", "org-9")}
+        store.record({"1": FetchRecord(usage={"five_hour": {"pct": 3.0}})}, other)
+        raw = json.loads(store.history_path.read_text(encoding="utf-8"))
+        slot = raw["accounts"]["1"]
+        assert (slot["email"], slot["organizationUuid"]) == other["1"]
+        assert slot["samples"] == [[clock.now, {"five_hour": 3.0}]]
+
+    def test_history_corrupt_file_is_empty(self, store, clock):
+        store.history_path.parent.mkdir(parents=True)
+        store.history_path.write_text("{not json", encoding="utf-8")
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)  # does not raise
+        assert _history_samples(store) == [
+            [clock.now, {"five_hour": 25.0, "seven_day": 10.0}]
+        ]
+        store.history_path.write_text(
+            json.dumps({"schemaVersion": 99, "accounts": {"1": {}}}), encoding="utf-8"
+        )
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_good == USAGE
+        assert entry.history == ()
+
+    def test_entries_exposes_history(self, store, clock):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(60)
+        store.record({"1": FetchRecord(usage={"five_hour": {"pct": 30.0}})}, IDENT)
+        entries = store.entries(IDENT)
+        assert entries["1"].history == (
+            (clock.now - 60, {"five_hour": 25.0, "seven_day": 10.0}),
+            (clock.now, {"five_hour": 30.0}),
+        )
+        assert entries["2"].history == ()  # never fetched
+        # another account now in the slot sees none of the old account's samples
+        assert store.entries({"1": ("new@x.com", "")})["1"].history == ()

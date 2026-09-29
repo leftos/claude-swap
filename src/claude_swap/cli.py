@@ -1063,8 +1063,9 @@ Commands:
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts
   %(prog)s import-usage <path>        adopt usage another machine read (list --json)
-  %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
-  %(prog)s watch                      dashboard, opened on the live watch page
+  %(prog)s tui                        interactive dashboard, opened on the watch &
+                                      auto-switch view (also: bare %(prog)s)
+  %(prog)s watch                      same as tui
   %(prog)s menubar                    macOS menu bar app
   %(prog)s menubar --install-service  keep the menu bar running via launchd
   %(prog)s upgrade                    self-upgrade to latest
@@ -1468,14 +1469,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             from claude_swap.transfer import import_usage
 
             import_usage(switcher, args.import_usage, hold_s=args.hold)
-        elif args.tui:
+        elif args.tui or args.watch:
             from claude_swap.tui import run as tui_run
 
             sys.exit(tui_run(switcher))
-        elif args.watch:
-            from claude_swap.tui import run as tui_run
-
-            sys.exit(tui_run(switcher, start="watch"))
         elif args.menubar:
             if sys.platform != "darwin":
                 error("The menu bar is only available on macOS.")

@@ -29,6 +29,7 @@ batch, not one request.
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
 from collections.abc import Callable, Iterable
@@ -49,6 +50,14 @@ from claude_swap.poll_policy import (
 from claude_swap.settings import atomic_write_json
 
 SCHEMA_VERSION = 2
+
+_logger = logging.getLogger("claude-swap")
+
+# ``cache/usage_history.json``: a short ring of per-window pct samples per
+# slot, appended on every successful fetch. Display-only (the TUI's recent
+# burn-rate projection); nothing that decides a switch or a poll reads it.
+HISTORY_SCHEMA_VERSION = 1
+HISTORY_KEEP_S = 7200.0  # samples older than this are pruned on write
 
 # Freshness is the reader's judgment per purpose, not a global TTL.
 # SERVE_TTL_S (re-exported from poll_policy — fresher than this → serve
@@ -314,6 +323,10 @@ class UsageEntry:
     # import-usage``) keeps every collector off this slot. Appended for the
     # same positional compatibility as ``claim_until``.
     held_until: float | None = None
+    # Recent ``(timestamp, {window key: pct})`` samples from
+    # ``usage_history.json``, oldest first, for display only. Appended for the
+    # same positional compatibility as ``claim_until``.
+    history: tuple[tuple[float, dict], ...] = ()
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
@@ -847,6 +860,7 @@ class UsageStore:
 
     def __init__(self, cache_dir: Path, clock: Callable[[], float] = time.time):
         self.path = cache_dir / "usage.json"
+        self.history_path = cache_dir / "usage_history.json"
         self._lock_path = cache_dir / ".usage.lock"
         self.clock = clock
 
@@ -881,6 +895,63 @@ class UsageStore:
     def _fresh_row(self, identity: Identity) -> dict:
         return {"email": identity[0], "organizationUuid": identity[1]}
 
+    # -- usage history (display-only) ---------------------------------------
+
+    def _read_history(self) -> dict[str, dict]:
+        """Per-slot history records; empty when missing, corrupt or another schema."""
+        try:
+            raw = json.loads(self.history_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            _logger.debug("usage history unreadable, treating as empty: %s", exc)
+            return {}
+        if not isinstance(raw, dict) or raw.get("schemaVersion") != HISTORY_SCHEMA_VERSION:
+            _logger.debug("usage history has an unknown schema, treating as empty")
+            return {}
+        accounts = raw.get("accounts")
+        return accounts if isinstance(accounts, dict) else {}
+
+    def _record_history(
+        self, samples: dict[str, tuple[Identity, dict[str, float]]], now: float
+    ) -> None:
+        """Append one sample per slot and prune old ones. Called under the lock.
+
+        Never raises: the history is display-only, so a failure here is logged
+        and must not fail (or undo) the measurement write it follows.
+        """
+        try:
+            accounts = self._read_history()
+            cutoff = now - HISTORY_KEEP_S
+            for num, (identity, sample) in samples.items():
+                slot = accounts.get(num)
+                if not self._matches(slot, identity):
+                    slot = self._fresh_row(identity)
+                assert isinstance(slot, dict)
+                kept = [s for s in _valid_samples(slot.get("samples")) if s[0] >= cutoff]
+                if not kept or kept[-1][0] != now:
+                    kept.append([now, sample])
+                slot["samples"] = kept
+                accounts[num] = slot
+            atomic_write_json(
+                self.history_path,
+                {"schemaVersion": HISTORY_SCHEMA_VERSION, "accounts": accounts},
+            )
+        except Exception:  # noqa: BLE001 — display-only data must never break record()
+            _logger.warning("could not write usage history", exc_info=True)
+
+    def _history_for(
+        self, history: dict[str, dict], num: str, identity: Identity, now: float
+    ) -> tuple[tuple[float, dict], ...]:
+        slot = history.get(num)
+        if not self._matches(slot, identity):
+            return ()
+        assert isinstance(slot, dict)
+        cutoff = now - HISTORY_KEEP_S
+        return tuple(
+            (t, sample) for t, sample in _valid_samples(slot.get("samples")) if t >= cutoff
+        )
+
     # -- read model -----------------------------------------------------------
 
     def entries(
@@ -897,6 +968,7 @@ class UsageStore:
         only read timestamps/last-good and never consult scoped resets."""
         now = self.clock()
         rows = self._read_rows()
+        history = self._read_history()
         out: dict[str, UsageEntry] = {}
         for num, identity in identities.items():
             row = rows.get(num)
@@ -966,6 +1038,7 @@ class UsageStore:
                 trust_extended=trust_extended,
                 claim_until=claim_until,
                 held_until=held_until,
+                history=self._history_for(history, num, identity, now),
             )
         return out
 
@@ -1166,6 +1239,15 @@ class UsageStore:
                 apply(num, row)
             if accepted:
                 self._write_rows(rows)
+                samples: dict[str, tuple[Identity, dict[str, float]]] = {}
+                for num in accepted:
+                    rec = outcomes[num]
+                    if rec.sentinel is None and rec.error is None and isinstance(rec.usage, dict):
+                        sample = _history_sample(rec.usage)
+                        if sample:
+                            samples[num] = (identities[num], sample)
+                if samples:
+                    self._record_history(samples, now)
         return accepted
 
     def adopt(
@@ -1309,6 +1391,42 @@ def _row_eligible(
     if repair_overslept:
         return poll_due or (stale and (next_poll_at is None or overslept))
     return poll_due or stale
+
+
+def _history_sample(usage: dict) -> dict[str, float]:
+    """``{window key: pct}`` for every window in a reading with a numeric pct.
+
+    Top-level windows keep their API key (``five_hour``/``seven_day``); scoped
+    per-model windows are keyed by their name. Spend is not a usage window.
+    """
+    sample: dict[str, float] = {}
+    for key in ("five_hour", "seven_day"):
+        window = usage.get(key)
+        if isinstance(window, dict):
+            pct = _num_or_none(window.get("pct"))
+            if pct is not None:
+                sample[key] = pct
+    scoped = usage.get("scoped")
+    for window in scoped if isinstance(scoped, list) else []:
+        if isinstance(window, dict) and isinstance(window.get("name"), str):
+            pct = _num_or_none(window.get("pct"))
+            if pct is not None:
+                sample[window["name"]] = pct
+    return sample
+
+
+def _valid_samples(raw: object) -> list[list]:
+    """The well-formed ``[timestamp, {key: pct}]`` pairs of a stored sample list."""
+    if not isinstance(raw, list):
+        return []
+    return [
+        [float(item[0]), item[1]]
+        for item in raw
+        if isinstance(item, list)
+        and len(item) == 2
+        and _num_or_none(item[0]) is not None
+        and isinstance(item[1], dict)
+    ]
 
 
 def with_sentinel(entry: UsageEntry, sentinel: str | None) -> UsageEntry:

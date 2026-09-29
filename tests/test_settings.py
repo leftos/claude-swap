@@ -151,6 +151,33 @@ class TestUiSettings:
         with pytest.raises(ConfigError, match="dark, light"):
             set_setting(tmp_path, "ui.theme", "purple")
 
+    def test_auto_live_defaults_to_false(self, tmp_path: Path):
+        assert load_ui_settings(tmp_path).auto_live is False
+        settings_path(tmp_path).write_text(json.dumps({"ui": {"theme": "light"}}))
+        assert load_ui_settings(tmp_path).auto_live is False
+
+    def test_auto_live_round_trips_through_set_setting(self, tmp_path: Path):
+        assert set_setting(tmp_path, "ui.autoLive", "true") is True
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw["ui"] == {"autoLive": True}
+        assert load_ui_settings(tmp_path).auto_live is True
+        assert set_setting(tmp_path, "ui.autoLive", "false") is False
+        assert load_ui_settings(tmp_path).auto_live is False
+
+    def test_non_bool_auto_live_falls_back_to_false(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"ui": {"theme": "light", "autoLive": "yes"}})
+        )
+        loaded = load_ui_settings(tmp_path)
+        assert loaded.auto_live is False
+        assert loaded.theme == "light"  # one bad key doesn't reset the others
+
+    def test_unknown_theme_keeps_auto_live(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"ui": {"theme": "purple", "autoLive": True}})
+        )
+        assert load_ui_settings(tmp_path) == UiSettings(theme="auto", auto_live=True)
+
 
 class TestSettingSpecs:
     def test_registry_covers_every_dataclass_field(self):

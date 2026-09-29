@@ -164,7 +164,9 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 ### Interactive dashboard (TUI)
 
-Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
+Run `cswap` on its own (or `cswap tui`, or `cswap watch`) for the full-screen dashboard, all keyboard-driven. It opens on **Watch & auto-switch**: every account as a full card with live usage, and the auto-switch engine running underneath, with a DRY-RUN / LIVE badge, a one-line ranking of the next-best accounts, and the engine's latest decision. `l` goes live (after a confirmation) or back to dry-run, and the choice is remembered for the next launch (`ui.autoLive`). `s` arms a manual switch, `t` then ←/→ adjusts the threshold for the session, and Esc leaves for the dashboard menu (switching, add / disable / remove accounts, theme). Works on macOS, Linux, and Windows.
+
+Usage bars and figures are coloured by pace against the time left in each window, like a budget: green is on pace to end the window at exactly 100%, blue is behind (quota that will go unused), yellow then red is ahead (heading for the limit before the reset). Each window also shows where the last 30 minutes of readings are heading: `out in 1h 20m`, `lasts to reset`, or `idle`. The readings are kept for two hours in `cache/usage_history.json`.
 
 <img src="assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
@@ -198,8 +200,8 @@ cswap alias                     # List all aliases
 cswap move 2 1                  # Assign an account to a slot (relocates to an empty slot, swaps if taken)
 cswap unclaimed                 # List stashed credential entries (slot + why they were stashed)
 cswap unclaimed --purge ID      # Drop one (deletes its bytes; recover with /login + `cswap add`)
-cswap tui                       # Interactive dashboard (also: bare `cswap`)
-cswap watch                     # Dashboard, opened on the live watch page
+cswap tui                       # Interactive dashboard, opened on Watch & auto-switch (also: bare `cswap`)
+cswap watch                     # Same as `cswap tui`
 cswap upgrade                   # Upgrade claude-swap to the latest version
 cswap purge                     # Remove all claude-swap data
 ```
@@ -274,6 +276,7 @@ cswap config                              # list effective settings ("(default)"
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
+cswap config set ui.autoLive true         # the TUI's auto-switch starts live instead of dry-run
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```
@@ -347,7 +350,7 @@ A row carries an additive `loginExpiresAt` (ISO-8601 UTC) when the stored login 
 
 An account row also carries an additive `alias` field once one is set with `cswap alias` (e.g. `"alias": "dev"`); accounts without one simply omit the key.
 
-Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) additively carry pace fields once the week is ~a day old: `expectedPct` (where usage would sit if spread evenly across the week) and `aheadOfPace` (`true` when meaningfully above that — the same signal the human views show as an `(ahead)`/`(ahead of pace)` marker). `projectedExhaustionAt`/`willLastToReset` extrapolate the current rate into an ETA to 100% and a yes/no "will it last to the reset"; they stay `--json`-only since a linear projection is too rough to present as fact in the UI.
+Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) additively carry pace fields once the week is ~a day old: `expectedPct` (where usage would sit if spread evenly across the week) and `aheadOfPace` (`true` when meaningfully above that — the same signal `cswap list` shows as an `(ahead)`/`(ahead of pace)` marker; the TUI shows it as colour). `projectedExhaustionAt`/`willLastToReset` extrapolate the current rate into an ETA to 100% and a yes/no "will it last to the reset"; they stay `--json`-only since a linear projection is too rough to present as fact in the UI.
 
 </details>
 

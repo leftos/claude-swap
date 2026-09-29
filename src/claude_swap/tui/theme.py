@@ -35,6 +35,21 @@ TRACK = "#3a3a3a"  # unfilled bar track
 WARN_PCT = 70.0
 CRIT_PCT = 90.0
 
+# Pace gradient stops (dark): on pace is green, behind fades to blue, ahead
+# runs through yellow (at the margin) to red (at twice it). The same stops as
+# the Claude Code statusline, so the two read alike side by side.
+PACE_ON = "#3fb96a"
+PACE_BEHIND = "#58a6ff"
+PACE_AHEAD = "#e8a531"
+PACE_FAR = "#ef5c5c"
+
+
+def _blend(start: str, end: str, t: float) -> str:
+    """``#rrggbb`` a fraction ``t`` (0..1) of the way from ``start`` to ``end``."""
+    a = [int(start[i : i + 2], 16) for i in (1, 3, 5)]
+    b = [int(end[i : i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x + (y - x) * t):02x}" for x, y in zip(a, b))
+
 
 @dataclass(frozen=True)
 class Palette:
@@ -53,6 +68,11 @@ class Palette:
     sev_warn: str
     sev_crit: str
     track: str
+    # Pace gradient stops (see ``pace_color``).
+    pace_on: str
+    pace_behind: str
+    pace_ahead: str
+    pace_far: str
 
     DARK: ClassVar["Palette"]
 
@@ -65,8 +85,28 @@ class Palette:
             return self.sev_warn
         return self.sev_ok
 
+    def pace_color(self, delta: float, margin: float) -> str:
+        """Color for a window ``delta`` points off pace (+ ahead, − behind).
+
+        On pace is ``pace_on``; behind fades to ``pace_behind`` at twice the
+        margin; ahead reaches ``pace_ahead`` at the margin and ``pace_far`` at
+        twice it. Beyond twice the margin either way the end stop holds.
+        """
+        span = margin * 2
+        if delta < 0:
+            return _blend(self.pace_on, self.pace_behind, min(1.0, -delta / span))
+        t = min(1.0, delta / span)
+        if t < 0.5:
+            return _blend(self.pace_on, self.pace_ahead, t * 2)
+        return _blend(self.pace_ahead, self.pace_far, (t - 0.5) * 2)
+
     @classmethod
     def from_theme(cls, theme: Theme) -> "Palette":
+        stops = (
+            (PACE_ON, PACE_BEHIND, PACE_AHEAD, PACE_FAR)
+            if theme.dark
+            else (PACE_ON_LIGHT, PACE_BEHIND_LIGHT, PACE_AHEAD_LIGHT, PACE_FAR_LIGHT)
+        )
         return cls(
             accent=theme.primary,
             foreground=theme.foreground,
@@ -75,6 +115,10 @@ class Palette:
             sev_warn=theme.warning,
             sev_crit=theme.error,
             track=theme.variables.get("track", TRACK),
+            pace_on=stops[0],
+            pace_behind=stops[1],
+            pace_ahead=stops[2],
+            pace_far=stops[3],
         )
 
 
@@ -112,6 +156,11 @@ SEV_OK_LIGHT = "#3d6b3d"  # forest green — deepened for AA on panel
 SEV_WARN_LIGHT = "#795911"  # deep ochre — deepened for AA on panel
 SEV_CRIT_LIGHT = "#ad3128"  # brick red — deepened for AA on panel
 TRACK_LIGHT = "#cec7ba"
+# Pace stops deepened for the light panel: the severity tones, plus a blue.
+PACE_ON_LIGHT = SEV_OK_LIGHT
+PACE_BEHIND_LIGHT = "#1f5fa8"
+PACE_AHEAD_LIGHT = SEV_WARN_LIGHT
+PACE_FAR_LIGHT = SEV_CRIT_LIGHT
 
 CSWAP_LIGHT = Theme(
     name="cswap-light",
@@ -138,4 +187,5 @@ CSWAP_LIGHT = Theme(
 Palette.DARK = Palette(
     accent=ACCENT, foreground=FOREGROUND, muted=MUTED,
     sev_ok=SEV_OK, sev_warn=SEV_WARN, sev_crit=SEV_CRIT, track=TRACK,
+    pace_on=PACE_ON, pace_behind=PACE_BEHIND, pace_ahead=PACE_AHEAD, pace_far=PACE_FAR,
 )

@@ -6,10 +6,10 @@ account-targeted opens a context of its own:
 
 - ``s`` / menu "Switch account" → :class:`SwitchScreen` — every account
   full-size, Enter switches, pops back.
-- ``w`` / menu "Watch accounts" / ``cswap watch`` → :class:`WatchScreen` —
-  the same full cards but read-only: a live monitor. ``s`` arms selection
-  (cursor appears on the active account), Enter switches and *stays
-  watching*, Esc disarms.
+- ``w`` / menu "Watch & auto-switch" → the live screen
+  (:mod:`claude_swap.tui.autoview`) — the same full cards as a live monitor,
+  with the auto-switch engine running below. The app opens on it, stacked
+  over this dashboard.
 - "Remove account" nests into a submenu listing the accounts.
 
 No global command palette: actions live where their context is.
@@ -41,11 +41,11 @@ _BACK = ("← back", "back")
 class DashboardScreen(Screen):
     BINDINGS = [
         Binding("s", "open_switch", "Switch accounts"),
-        Binding("w", "app.open_watch", "Watch"),
+        Binding("w", "app.open_live", "Watch & auto"),
         Binding("escape,left", "menu_back", "Back", show=False),
         Binding("q", "app.quit", "Quit"),
         # Power shortcuts; the menu is the discoverable path.
-        Binding("g", "app.open_auto", "Auto view", show=False),
+        Binding("g", "app.open_live", "Watch & auto", show=False),
         Binding("f", "app.refresh_full", "Refresh usage", show=False),
         Binding("j", "cursor_down", show=False),
         Binding("k", "cursor_up", show=False),
@@ -75,8 +75,7 @@ class DashboardScreen(Screen):
         # wrongly imply the user has to. `f` stays as a hidden escape hatch.
         return [
             ("Switch account…", "switch"),
-            ("Watch accounts", "watch"),
-            ("Auto-switch view", "auto"),
+            ("Watch & auto-switch", "live"),
             ("Add account…", "add-menu"),
             ("Disable / enable account…", "disable-menu"),
             ("Remove account…", "remove-menu"),
@@ -159,8 +158,7 @@ class DashboardScreen(Screen):
         app = self.app
         actions: dict[str, Callable[[], None]] = {
             "switch": self.action_open_switch,
-            "watch": app.action_open_watch,
-            "auto": app.action_open_auto,
+            "live": app.action_open_live,
             "add-login": app.action_add_current,
             "add-token": app.action_add_token,
             "quit": app.exit,
@@ -215,8 +213,8 @@ class AccountListScreen(Screen):
     """Shared machinery: a live ListView of full account cards.
 
     Subclasses decide what the cursor does — :class:`SwitchScreen` is
-    selection-first, :class:`WatchScreen` is a monitor that can arm
-    selection on demand.
+    selection-first, the live screen (:mod:`claude_swap.tui.autoview`) is a
+    monitor that can arm selection on demand.
     """
 
     app: "CswapApp"
@@ -327,106 +325,3 @@ class SwitchScreen(AccountListScreen):
 
     def action_back(self) -> None:
         self.app.pop_screen()
-
-
-class WatchScreen(AccountListScreen):
-    """Live monitor of every account, full detail, hands-off by default.
-
-    ``s`` arms selection (cursor appears on the active account); Enter then
-    switches and stays here — you keep watching on the new account. Esc
-    disarms selection first, then leaves the screen.
-    """
-
-    _WATCH_TITLE = "watching all accounts"
-    _SELECT_TITLE = "switch to which account? · enter confirm · esc cancel"
-
-    BINDINGS = [
-        Binding("s", "toggle_select", "Switch"),
-        Binding("enter", "select_highlighted", "Confirm", priority=True),
-        Binding("f", "app.refresh_full", "Refresh", show=False),
-        Binding("escape,q", "back", "Back"),
-        Binding("down,j", "nav_down", show=False),
-        Binding("up,k", "nav_up", show=False),
-    ]
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._selecting = False
-
-    def on_mount(self) -> None:
-        self.watch(self.app, "refresh_status", self._on_refresh_status)
-        self.query_one("#list-title", Static).update(self._title_text())
-        super().on_mount()
-
-    def _title_text(self) -> str:
-        if self._selecting:
-            return self._SELECT_TITLE
-        status = self.app.refresh_status
-        return f"{self._WATCH_TITLE} · {status}" if status else self._WATCH_TITLE
-
-    def _on_refresh_status(self, status: str) -> None:
-        if not self._selecting:
-            self.query_one("#list-title", Static).update(self._title_text())
-
-    def check_action(self, action: str, parameters: tuple) -> bool | None:
-        if action == "select_highlighted" and not self._selecting:
-            return False  # hidden and inert until selection is armed
-        return True
-
-    def _index_after_build(
-        self, snap: AccountsSnapshot, first_build: bool, previous: int | None
-    ) -> int | None:
-        if not self._selecting:
-            return None  # monitor mode: no cursor at all
-        return super()._index_after_build(snap, first_build, previous)
-
-    def _set_selecting(self, on: bool) -> None:
-        self._selecting = on
-        listview = self.query_one("#accounts", ListView)
-        title = self.query_one("#list-title", Static)
-        if on:
-            snap = self.app.snapshot
-            if snap is not None and snap.accounts:
-                listview.index = self._active_index(snap)
-            listview.focus()
-            title.update(self._SELECT_TITLE)
-        else:
-            listview.index = None
-            self.set_focus(None)
-            title.update(self._title_text())
-        self.refresh_bindings()
-
-    def action_toggle_select(self) -> None:
-        self._set_selecting(not self._selecting)
-
-    def on_list_view_selected(self, event: ListView.Selected) -> None:
-        if not self._selecting:
-            return  # e.g. a stray click while just watching
-        item = event.item
-        if isinstance(item, AccountItem):
-            self.app.do_switch(item.number)
-            self._set_selecting(False)  # stay here, keep watching
-
-    def action_select_highlighted(self) -> None:
-        if self._selecting:
-            self.query_one("#accounts", ListView).action_select_cursor()
-
-    def action_back(self) -> None:
-        if self._selecting:
-            self._set_selecting(False)
-        else:
-            self.app.pop_screen()
-
-    def action_nav_down(self) -> None:
-        listview = self.query_one("#accounts", ListView)
-        if self._selecting:
-            listview.action_cursor_down()
-        else:
-            listview.scroll_down(animate=False)
-
-    def action_nav_up(self) -> None:
-        listview = self.query_one("#accounts", ListView)
-        if self._selecting:
-            listview.action_cursor_up()
-        else:
-            listview.scroll_up(animate=False)

@@ -61,10 +61,13 @@ class AutoSwitchSettings:
 
 @dataclass(frozen=True)
 class UiSettings:
-    """Appearance preferences (``ui`` section). ``theme`` selects the TUI/CLI
-    color theme; ``auto`` follows terminal-background detection."""
+    """Interface preferences (``ui`` section). ``theme`` selects the TUI/CLI
+    color theme; ``auto`` follows terminal-background detection.
+    ``auto_live`` makes the TUI's auto-switch view start live (switching
+    accounts) instead of dry-run."""
 
     theme: str = "auto"
+    auto_live: bool = False
 
 
 _SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
@@ -138,6 +141,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
+        ),
+        SettingSpec(
+            "ui", "autoLive", "auto_live", "bool",
+            help="Auto-switch view starts live (switches accounts) instead of dry-run",
         ),
     )
 }
@@ -232,7 +239,7 @@ def load_settings(backup_root: Path) -> AutoSwitchSettings:
 
 
 def load_ui_settings(backup_root: Path) -> UiSettings:
-    """Load the ui section; missing/corrupt file or unknown theme → default."""
+    """Load the ui section; missing/corrupt file or a bad value → its default."""
     raw = _read_raw(settings_path(backup_root))
     section = raw.get("ui")
     default = UiSettings()
@@ -244,8 +251,15 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
             "settings.json: unsupported ui.theme %r; using %r",
             theme, default.theme,
         )
-        return default
-    return UiSettings(theme=theme)
+        theme = default.theme
+    auto_live = section.get("autoLive", default.auto_live)
+    if not isinstance(auto_live, bool):
+        _logger.warning(
+            "settings.json: unsupported ui.autoLive %r; using %r",
+            auto_live, default.auto_live,
+        )
+        auto_live = default.auto_live
+    return UiSettings(theme=theme, auto_live=auto_live)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:

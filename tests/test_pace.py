@@ -167,3 +167,94 @@ class TestAheadVsWillLastRelationship:
         assert result is not None
         assert result.ahead is False
         assert pace.will_last_to_reset(result) is False
+
+
+class TestPaceDelta:
+    def test_window_elapsed_matches_compute_pace(self):
+        for resets_at in (NOW + 6 * DAY, NOW - 2 * WEEK - DAY, NOW + 2.5 * DAY):
+            window = _window(40.0, resets_at)
+            result = pace.compute_pace(window, fetched_at=NOW)
+            assert result is not None
+            assert pace.window_elapsed(window, now=NOW, period_s=WEEK) == result.elapsed_s
+        assert pace.window_elapsed(None, now=NOW, period_s=WEEK) is None
+        assert pace.window_elapsed({"pct": 10.0}, now=NOW, period_s=WEEK) is None
+        assert pace.window_elapsed({"resets_at": _iso(NOW + DAY)}, now=NOW, period_s=WEEK) is None
+
+    def test_pace_delta_on_pace_is_zero(self):
+        period, margin = pace.window_period_and_margin("five_hour")
+        assert (period, margin) == (pace.PERIOD_5H_S, pace.PACE_MARGIN_5H)
+        halfway = _window(50.0, NOW + period / 2)
+        assert pace.pace_delta(halfway, now=NOW, period_s=period) == 0.0
+        ahead = _window(70.0, NOW + period / 2)
+        assert pace.pace_delta(ahead, now=NOW, period_s=period) == 20.0
+        # weekly windows (seven_day and scoped names) share the weekly period
+        assert pace.window_period_and_margin("seven_day") == (WEEK, pace.PACE_MARGIN_WEEKLY)
+        assert pace.window_period_and_margin("Fable") == (WEEK, pace.PACE_MARGIN_WEEKLY)
+        behind = _window(10.0, NOW + 3 * DAY)  # 4 of 7 days gone, ~57% expected
+        delta = pace.pace_delta(behind, now=NOW, period_s=WEEK)
+        assert delta is not None and abs(delta - (10.0 - 4 / 7 * 100.0)) < 1e-9
+        assert pace.pace_delta({"pct": 10.0}, now=NOW, period_s=WEEK) is None
+
+
+def _samples(*points: tuple[float, float], key: str = "five_hour") -> tuple:
+    """``(seconds relative to NOW, pct)`` points as store history samples."""
+    return tuple((NOW + offset, {key: pct}) for offset, pct in points)
+
+
+def _project(samples: tuple, *, now: float = NOW, pct: float = 50.0, resets_at_ts=None):
+    return pace.recent_projection(
+        samples, "five_hour", now=now, pct=pct, resets_at_ts=resets_at_ts
+    )
+
+
+class TestRecentProjection:
+    def test_projection_needs_two_samples(self):
+        assert _project(()) is None
+        assert _project(_samples((0, 40.0))) is None
+        # a sample carrying only another window does not count
+        other = _samples((-1200, 5.0), key="seven_day")
+        assert _project(other + _samples((0, 40.0))) is None
+
+    def test_projection_needs_min_span(self):
+        assert _project(_samples((-599, 30.0), (0, 40.0))) is None
+        assert _project(_samples((-600, 30.0), (0, 40.0))) is not None
+
+    def test_projection_idle_when_flat(self):
+        assert _project(_samples((-1200, 40.0), (0, 40.0))) == pace.Projection("idle", None)
+
+    def test_projection_idle_when_falling_after_reset_discard(self):
+        # 80 → 90, then the window reset to 5 and stayed there: what is left
+        # after dropping the pre-reset samples is flat.
+        samples = _samples((-1500, 80.0), (-1200, 90.0), (-900, 5.0), (0, 5.0))
+        assert _project(samples, pct=5.0) == pace.Projection("idle", None)
+
+    def test_projection_discards_samples_before_reset(self):
+        # Only 5 → 20 over the last 900 s counts: 15 points per 900 s leaves
+        # 80 points = 4800 s. Keeping the pre-reset 80/90 would read as falling.
+        samples = _samples((-1500, 80.0), (-1200, 90.0), (-900, 5.0), (0, 20.0))
+        assert _project(samples, pct=20.0) == pace.Projection("out", 4800.0)
+
+    def test_projection_ignores_samples_older_than_lookback(self):
+        # Inside the 30-minute lookback: 40 → 50 over 1200 s → 50 points in 6000 s.
+        samples = _samples((-3000, 0.0), (-1200, 40.0), (0, 50.0))
+        assert _project(samples) == pace.Projection("out", 6000.0)
+
+    def test_projection_out_eta(self):
+        # 20 points per 1200 s; 40 points to go → 2400 s, reset 4h away.
+        samples = _samples((-1200, 40.0), (0, 60.0))
+        result = _project(samples, pct=60.0, resets_at_ts=NOW + 4 * 3600)
+        assert result == pace.Projection("out", 2400.0)
+
+    def test_projection_lasts_when_eta_after_reset(self):
+        samples = _samples((-1200, 40.0), (0, 60.0))
+        result = _project(samples, pct=60.0, resets_at_ts=NOW + 1800)
+        assert result == pace.Projection("lasts", None)
+
+    def test_projection_eta_counts_time_since_last_sample(self):
+        samples = _samples((-1200, 40.0), (0, 60.0))
+        assert _project(samples, now=NOW + 600, pct=60.0) == pace.Projection("out", 1800.0)
+        assert _project(samples, now=NOW + 5000, pct=60.0) == pace.Projection("out", 0.0)
+
+    def test_projection_none_when_maxed(self):
+        samples = _samples((-1200, 40.0), (0, 100.0))
+        assert _project(samples, pct=100.0) is None

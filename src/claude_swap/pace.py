@@ -15,6 +15,11 @@ no influence on poll cadence (that stays entirely in ``poll_policy``). Elapsed
 time is measured against ``fetched_at`` rather than wall-clock ``now()``, so a
 snapshot served stale (last-good data re-served after a failed refetch) is
 evaluated against the clock it was actually measured at.
+
+The TUI's display helpers (``pace_delta``, ``recent_projection``) are pure as
+well and cover the 5h window too: there the pace only colours a figure, and
+the projection extrapolates the store's recent samples, not the whole cycle.
+Neither feeds the auto-switch engine or the poll planner.
 """
 
 from __future__ import annotations
@@ -24,6 +29,13 @@ from datetime import datetime
 
 # Weekly windows reset on a fixed 7-day cadence (matches menubar._WEEKLY_PERIOD_S).
 WEEKLY_PERIOD_S = 7 * 86400.0
+PERIOD_5H_S = 5 * 3600.0
+
+# Percentage points off pace at which the TUI's pace colour reaches the
+# "ahead" stop (and the far stop at twice this). A short window moves more per
+# prompt, so it gets the wider margin.
+PACE_MARGIN_5H = 10.0
+PACE_MARGIN_WEEKLY = 5.0
 
 # Suppress the marker for this long after a weekly reset. Right after reset,
 # elapsed is tiny so `expected_pct` is near zero and almost any usage reads as
@@ -62,6 +74,112 @@ def _resets_at_ts(resets_at: object) -> float | None:
         return None
 
 
+def window_elapsed(window: dict | None, *, now: float, period_s: float) -> float | None:
+    """Seconds since the window's current cycle started, as of ``now``.
+
+    ``resets_at`` is the *next* reset; the cycle start is found by rolling it
+    by whole ``period_s`` increments until it lands at or before ``now``, so a
+    ``resets_at`` any number of cycles stale still resolves. None when the
+    window's ``pct`` or ``resets_at`` is missing or unusable.
+    """
+    if not isinstance(window, dict):
+        return None
+    if not isinstance(window.get("pct"), (int, float)):
+        return None
+    next_reset = _resets_at_ts(window.get("resets_at"))
+    if next_reset is None:
+        return None
+    # (next_reset - now) mod period_s == time remaining until the next reset,
+    # folded into [0, period_s). period_s minus that is elapsed time since the
+    # current window started — works regardless of how many whole cycles
+    # next_reset is ahead of or behind now.
+    remaining = (next_reset - now) % period_s
+    return 0.0 if remaining == 0 else period_s - remaining
+
+
+def pace_delta(window: dict | None, *, now: float, period_s: float) -> float | None:
+    """Points used above (+) or below (−) the share of the cycle already elapsed.
+
+    Zero is exactly on pace: the rate that ends the cycle at 100%. No
+    after-reset suppression — this only colours a figure. None when the
+    window's pct or reset time is unusable.
+    """
+    elapsed = window_elapsed(window, now=now, period_s=period_s)
+    if elapsed is None:
+        return None
+    assert isinstance(window, dict)
+    return float(window["pct"]) - elapsed / period_s * 100.0
+
+
+def window_period_and_margin(key: str) -> tuple[float, float]:
+    """``(cycle length, pace margin)`` for a window key: the 5h window, or a
+    weekly one (``seven_day`` and every scoped per-model window)."""
+    if key == "five_hour":
+        return PERIOD_5H_S, PACE_MARGIN_5H
+    return WEEKLY_PERIOD_S, PACE_MARGIN_WEEKLY
+
+
+@dataclass(frozen=True)
+class Projection:
+    """When a window runs out at its recent burn rate.
+
+    ``kind`` is ``"out"`` (runs out ``eta_s`` seconds from now, before the
+    reset), ``"lasts"`` (the reset comes first) or ``"idle"`` (no usage
+    growth over the lookback); ``eta_s`` is set only for ``"out"``.
+    """
+
+    kind: str
+    eta_s: float | None
+
+
+def recent_projection(
+    samples: tuple[tuple[float, dict], ...],
+    key: str,
+    *,
+    now: float,
+    pct: float,
+    resets_at_ts: float | None,
+    lookback_s: float = 1800.0,
+    min_span_s: float = 600.0,
+) -> Projection | None:
+    """Extrapolate one window's recent samples to the moment it hits 100%.
+
+    Uses only samples since the window's last reset (a drop between two
+    consecutive samples) and within ``lookback_s`` of the newest one. None
+    when the window is already maxed, or there are fewer than two usable
+    samples spanning at least ``min_span_s``.
+    """
+    if pct >= 100:
+        return None
+    points = sorted(
+        (float(t), float(sample[key]))
+        for t, sample in samples
+        if isinstance(sample.get(key), (int, float))
+    )
+    since_reset: list[tuple[float, float]] = []  # newest first
+    for t, value in reversed(points):
+        if since_reset and value > since_reset[-1][1]:
+            break  # the window reset between this sample and the next-newer one
+        since_reset.append((t, value))
+    if not since_reset:
+        return None
+    newest_t, newest_pct = since_reset[0]
+    recent = [(t, value) for t, value in since_reset if t >= newest_t - lookback_s]
+    if len(recent) < 2:
+        return None
+    oldest_t, oldest_pct = recent[-1]
+    span = newest_t - oldest_t
+    if span < min_span_s:
+        return None
+    rate = (newest_pct - oldest_pct) / span
+    if rate <= 0:
+        return Projection("idle", None)
+    eta_now = max(0.0, (100.0 - newest_pct) / rate - (now - newest_t))
+    if resets_at_ts is not None and now + eta_now >= resets_at_ts:
+        return Projection("lasts", None)
+    return Projection("out", eta_now)
+
+
 def compute_pace(
     window: dict | None,
     *,
@@ -86,28 +204,18 @@ def compute_pace(
     """
     if not isinstance(window, dict) or fetched_at is None:
         return None
-    pct = window.get("pct")
-    if not isinstance(pct, (int, float)):
+    elapsed = window_elapsed(window, now=fetched_at, period_s=period_s)
+    if elapsed is None:
         return None
-    next_reset = _resets_at_ts(window.get("resets_at"))
-    if next_reset is None:
-        return None
-
-    # (next_reset - fetched_at) mod period_s == time remaining until the next
-    # reset, folded into [0, period_s). period_s minus that is elapsed time
-    # since the current window started — works regardless of how many whole
-    # cycles next_reset is ahead of or behind fetched_at.
-    remaining = (next_reset - fetched_at) % period_s
-    elapsed = 0.0 if remaining == 0 else period_s - remaining
-
     if elapsed < suppress_after_reset_s:
         return None
 
+    pct = float(window["pct"])
     expected_pct = min(100.0, (elapsed / period_s) * 100.0)
-    ahead = (float(pct) - expected_pct) >= ahead_threshold_pct
+    ahead = (pct - expected_pct) >= ahead_threshold_pct
     return PaceResult(
         expected_pct=expected_pct,
-        actual_pct=float(pct),
+        actual_pct=pct,
         elapsed_s=elapsed,
         period_s=period_s,
         ahead=ahead,
