@@ -1381,6 +1381,46 @@ class TestReserve:
         other = {"2": ("new@x.com", "org-9")}
         assert set(store.reserve(["2"], other, respect_plans=True)) == {"2"}
 
+    def test_reserve_force_ignores_ttl_and_plan(self, store, clock):
+        # Engine warm-up: a reading inside the serve TTL with a future plan
+        # is refused by every scheduling mode and still won by force.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.set_poll_plan({"1": (clock.now + 600.0, 600.0)}, IDENT)
+        clock.advance(1)
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+        assert store.reserve(["1"], IDENT, respect_plans=False) == {}
+        assert store.reserve(
+            ["1"], IDENT, respect_plans=False, repair_overslept=True
+        ) == {}
+        assert set(
+            store.reserve(["1"], IDENT, respect_plans=False, force=True)
+        ) == {"1"}
+
+    def test_reserve_force_respects_backoff_held_dead_and_claims(
+        self, store, clock
+    ):
+        dead = {"3": ("dead@x.com", "")}
+        store.record({"3": FetchRecord(error="invalid_grant")}, dead)
+        clock.advance(TRUST_MAX_AGE_S)  # backoff long gone; the strike stays
+        assert store.reserve(["3"], dead, respect_plans=False, force=True) == {}
+
+        store.claim(["1"], IDENT)  # a concurrent collector's live lease
+        assert store.reserve(["1"], IDENT, respect_plans=False, force=True) == {}
+        clock.advance(CLAIM_TTL_S + 1)
+        assert set(
+            store.reserve(["1"], IDENT, respect_plans=False, force=True)
+        ) == {"1"}
+
+        backoff = {"4": ("backoff@x.com", "")}
+        store.record({"4": FetchRecord(error="timeout")}, backoff)
+        clock.advance(1)
+        assert store.reserve(["4"], backoff, respect_plans=False, force=True) == {}
+
+        held = {"5": ("held@x.com", "")}
+        store.adopt({"5": (USAGE, 0.0)}, held, hold_s=600.0)
+        clock.advance(SERVE_TTL_S + 1)  # stale, yet the hold still refuses
+        assert store.reserve(["5"], held, respect_plans=False, force=True) == {}
+
 
 class TestLast429Marker:
     def test_last_429_survives_recovery(self, store, clock):

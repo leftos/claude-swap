@@ -57,6 +57,8 @@ class CswapApp(App):
         detected: str | None = None,
     ) -> None:
         super().__init__()
+        # Wall time the app came up; the live screen's engine warms up from it.
+        self.started_at = time.time()
         self.switcher = switcher
         self._detected = detected  # terminal background sensed pre-driver, or None
         self.source = SnapshotSource(switcher)

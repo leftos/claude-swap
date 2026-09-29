@@ -28,10 +28,11 @@ from claude_swap.autoswitch import (
     TickOutcome,
     UnquarantineEvent,
     _recovery_is_useful,
+    _warm_settled,
     pct_label,
 )
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
-from claude_swap.usage_store import FetchRecord, UsageEntry
+from claude_swap.usage_store import CLAIM_TTL_S, FetchRecord, UsageEntry
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -111,6 +112,7 @@ class EngineHarness:
         self.engine = self._make_engine()
 
     def _make_engine(self, **kwargs) -> AutoSwitchEngine:
+        kwargs.setdefault("warm_since", None)
         return AutoSwitchEngine(
             self.switcher,
             self.settings,
@@ -6893,4 +6895,241 @@ class TestFreshenRoutesThroughGate:
         assert verdict == "ok"
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
+
+
+_WARM_IDENT = {
+    "1": ("a@example.com", ""),
+    "2": ("b@example.com", ""),
+    "3": ("c@example.com", ""),
+}
+
+
+class TestWarmUp:
+    """Start-up warm-up gate: with ``warm_since`` set, no decision of any
+    kind until every rotation account has been polled once since then."""
+
+    @pytest.fixture(autouse=True)
+    def _no_profile_probe(self):
+        with patch("claude_swap.oauth.fetch_oauth_profile", return_value=None):
+            yield
+
+    def _harness(self, temp_home, monkeypatch, **settings_kwargs):
+        monkeypatch.setattr("claude_swap.switcher._FETCH_STAGGER_S", 0)
+        h = EngineHarness(temp_home, **settings_kwargs)
+        for num, (email, _org) in _WARM_IDENT.items():
+            h.seed(int(num), email)
+        h.make_live("a@example.com", 1)
+        monkeypatch.setattr(h.switcher, "_live_session_pids", lambda *a: [])
+        return h
+
+    @staticmethod
+    def _store_pre_boot(h, usage, plan_s=600.0):
+        """Readings and future plans the store already holds at start, 30s
+        old: inside SERVE_TTL_S and STALE_OK_S, so decision-trusted."""
+        store = h.switcher._usage_store
+        store.record(
+            {num: FetchRecord(usage=value) for num, value in usage.items()},
+            _WARM_IDENT,
+        )
+        store.set_poll_plan(
+            {num: (h.clock.now + plan_s, plan_s) for num in usage}, _WARM_IDENT
+        )
+        h.clock.advance(30)
+
+    @staticmethod
+    def _warm(h):
+        h.engine = h._make_engine(warm_since=h.clock.now)
+
+    @staticmethod
+    def _tick(h, counts, usage_by_num, errors_by_num=None):
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            side_effect=TestAdaptiveScheduler._counting_fetch(
+                counts, usage_by_num, errors_by_num
+            ),
+        ):
+            return h.engine.tick()
+
+    @staticmethod
+    def _reasons(h) -> list[str]:
+        return [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    def _claimed_three(self, temp_home, monkeypatch):
+        """Active over the threshold on stored data; account 3 is mid-fetch
+        by a concurrent poller, so the first warm-up tick cannot settle it."""
+        h = self._harness(temp_home, monkeypatch)
+        stored = {"1": _usage(95), "2": _usage(10), "3": _usage(20)}
+        self._store_pre_boot(h, stored)
+        self._warm(h)
+        h.switcher._usage_store.claim(["3"], {"3": _WARM_IDENT["3"]})
+        return h, stored
+
+    def test_warmup_none_keeps_existing_behaviour(self, temp_home, monkeypatch):
+        h = self._harness(temp_home, monkeypatch)
+        stored = {"1": _usage(95), "2": _usage(10), "3": _usage(20)}
+        self._store_pre_boot(h, stored)
+        counts: dict[str, int] = {}
+        # The harness engine is built with warm_since=None.
+        assert self._tick(h, counts, stored) is TickOutcome.SWITCHED
+        assert counts == {}  # decided on the stored readings alone
+        assert "warming-up" not in self._reasons(h)
+        assert h.active_number() == 2
+
+    def test_warmup_blocks_switch_until_all_polled(self, temp_home, monkeypatch):
+        h, stored = self._claimed_three(temp_home, monkeypatch)
+        counts: dict[str, int] = {}
+        assert self._tick(h, counts, stored) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert self._reasons(h) == ["warming-up"]
+        assert any(isinstance(e, PollEvent) for e in h.events)
+
+        h.clock.advance(CLAIM_TTL_S + 1)  # the concurrent lease lapses
+        assert self._tick(h, counts, stored) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        # Each account fetched once since start; 1 and 2 were not refetched.
+        assert counts == {"1": 1, "2": 1, "3": 1}
+
+    def test_warmup_detail_reports_progress(self, temp_home, monkeypatch):
+        h, stored = self._claimed_three(temp_home, monkeypatch)
+        self._tick(h, {}, stored)
+        warming = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert [(e.reason, e.detail) for e in warming] == [
+            ("warming-up", "2/3 accounts polled since start")
+        ]
+        assert warming[0].human() == (
+            "no switch: warming-up (2/3 accounts polled since start)"
+        )
+
+    def test_warmup_forces_fetch_ignoring_ttl_and_plans(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home, monkeypatch)
+        stored = {"1": _usage(10), "2": _usage(20), "3": _usage(30)}
+        self._store_pre_boot(h, stored)  # fresh, future plans: nothing due
+        self._warm(h)
+        counts: dict[str, int] = {}
+        assert self._tick(h, counts, stored) is TickOutcome.NO_ACTION
+        assert counts == {"1": 1, "2": 1, "3": 1}
+        # The fetches recorded new plans, as any fetch does.
+        entries = h.switcher._usage_store.entries(_WARM_IDENT)
+        assert all(entries[n].fetched_at == h.clock.now for n in _WARM_IDENT)
+
+    def test_warmup_respects_backoff_and_counts_it_settled(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home, monkeypatch)
+        stored = {"1": _usage(10), "2": _usage(20), "3": _usage(30)}
+        self._store_pre_boot(h, stored)
+        h.switcher._usage_store.record(
+            {"3": FetchRecord(error="http-429", retry_after_s=600.0)},
+            _WARM_IDENT,
+        )
+        h.clock.advance(1)
+        self._warm(h)
+        counts: dict[str, int] = {}
+        assert self._tick(h, counts, stored) is TickOutcome.NO_ACTION
+        assert counts == {"1": 1, "2": 1}  # the backoff is not defeated
+        # ...and does not hold the gate: this tick already decided.
+        assert self._reasons(h) == ["below-threshold"]
+
+    def test_warmup_counts_failed_attempt_as_settled(self, temp_home, monkeypatch):
+        h = self._harness(temp_home, monkeypatch)
+        self._warm(h)
+        counts: dict[str, int] = {}
+        usage = {"1": _usage(10), "2": _usage(20)}
+        outcome = self._tick(h, counts, usage, errors_by_num={"3": "timeout"})
+        assert outcome is TickOutcome.NO_ACTION
+        assert counts == {"1": 1, "2": 1, "3": 1}
+        assert self._reasons(h) == ["below-threshold"]
+
+        # The predicate itself, apart from the backoff a failure also sets.
+        since = 100.0
+        failed = UsageEntry(
+            consecutive_failures=1, last_attempt_at=since + 5, claim_until=0.0
+        )
+        assert _warm_settled(failed, since, since + 10)
+        # A live claim is a concurrent collector mid-fetch, not a result.
+        assert not _warm_settled(
+            replace(failed, claim_until=since + 60), since, since + 10
+        )
+        # A failure from before the start is not a poll since the start.
+        assert not _warm_settled(
+            replace(failed, last_attempt_at=since - 1), since, since + 10
+        )
+
+    def test_warmup_counts_sentinel_accounts_settled(self, harness):
+        harness.engine = harness._make_engine(warm_since=harness.clock.now)
+        now = harness.clock.now
+        entries = {
+            "1": _entry_for(_usage(50), now),
+            "2": _entry_for(_usage(10), now),
+            "3": UsageEntry(sentinel=USAGE_TOKEN_EXPIRED),
+        }
+        assert harness.tick_with_entries(entries) is TickOutcome.NO_ACTION
+        assert self._reasons(harness) == ["below-threshold"]
+
+    def test_warmup_ignores_disabled_and_quarantined(self, harness):
+        data = harness.switcher._get_sequence_data()
+        data["accounts"]["2"]["disabled"] = True
+        harness.switcher._write_json(harness.switcher.sequence_file, data)
+        harness.engine = harness._make_engine(warm_since=harness.clock.now)
+        harness.engine._quarantine("3", "c@example.com", "invalid_grant")
+        never = {"1": UsageEntry(), "2": UsageEntry(), "3": UsageEntry()}
+        assert harness.tick_with_entries(never) is TickOutcome.NO_ACTION
+        warming = [e for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert [(e.reason, e.detail) for e in warming] == [
+            ("warming-up", "0/1 accounts polled since start")
+        ]
+
+    def test_warmup_decides_on_completing_tick(self, temp_home, monkeypatch):
+        h = self._harness(temp_home, monkeypatch)
+        stored = {"1": _usage(95), "2": _usage(10), "3": _usage(20)}
+        self._store_pre_boot(h, stored)
+        self._warm(h)
+        counts: dict[str, int] = {}
+        assert self._tick(h, counts, stored) is TickOutcome.SWITCHED
+        assert counts == {"1": 1, "2": 1, "3": 1}
+        assert "warming-up" not in self._reasons(h)
+        assert h.active_number() == 2
+
+    def test_warmup_no_failover_or_idle_hold_while_warming(self, harness):
+        harness.engine = harness._make_engine(warm_since=harness.clock.now)
+        now = harness.clock.now
+        unknown = {
+            "1": UsageEntry(),  # never read: would count toward failover
+            "2": _entry_for(_usage(10), now),
+            "3": _entry_for(_usage(20), now),
+        }
+        for _ in range(harness.settings.unhealthy_ticks + 2):
+            assert harness.tick_with_entries(unknown) is TickOutcome.NO_ACTION
+            harness.clock.advance(60)
+        assert harness.engine._unhealthy_ticks == 0
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+
+        held = {
+            "1": UsageEntry(sentinel=USAGE_TOKEN_EXPIRED),  # would idle-hold
+            "2": _entry_for(_usage(10), now),
+            "3": UsageEntry(),
+        }
+        assert harness.tick_with_entries(held) is TickOutcome.NO_ACTION
+        assert harness.engine._idle_hold_since is None
+        assert harness.engine._idle_hold_slow is False
+        assert set(self._reasons(harness)) == {"warming-up"}
+        assert harness.active_number() == 1
+
+    def test_warmup_uses_normal_interval(self, harness):
+        harness.engine = harness._make_engine(warm_since=harness.clock.now)
+        now = harness.clock.now
+        held = {
+            "1": UsageEntry(sentinel=USAGE_TOKEN_EXPIRED),
+            "2": _entry_for(_usage(10), now),
+            "3": UsageEntry(),
+        }
+        outcome = harness.tick_with_entries(held)
+        assert self._reasons(harness) == ["warming-up"]
+        interval = harness.settings.interval_seconds
+        delay = harness.engine._next_delay(outcome)
+        assert 0.9 * interval <= delay <= 1.1 * interval
+        assert delay < NO_RESET_FALLBACK_S
 

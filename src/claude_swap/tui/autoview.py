@@ -329,6 +329,9 @@ class LiveScreen(AccountListScreen):
             self._settings,
             self._emit_from_thread,
             dry_run=dry_run,
+            # App start, not engine start: a restart via `l` keeps counting
+            # the accounts already polled since the app came up.
+            warm_since=self.app.started_at,
         )
         self._engine = engine
         self.run_worker(

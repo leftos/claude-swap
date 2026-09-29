@@ -1190,10 +1190,13 @@ class _FakeEngine:
     # Emit one decision as the loop starts, as the real engine's first tick does.
     emit_on_start = True
 
-    def __init__(self, switcher, settings, on_event, *, dry_run=False, **kwargs):
+    def __init__(
+        self, switcher, settings, on_event, *, dry_run=False, warm_since, **kwargs
+    ):
         self.settings = settings
         self.on_event = on_event
         self.dry_run = dry_run
+        self.warm_since = warm_since
         self.stopped = False
         self.applied_thresholds: list[float] = []
         self.wakes = 0
@@ -1653,6 +1656,38 @@ class TestLiveScreen:
             screen._on_engine_event(SleepEvent(seconds=120.0, until="12:00"))
             await pilot.pause()
             assert "no switch: cooldown" in rendered(app, "#last-decision")
+
+    async def test_warming_up_shows_in_last_decision(self, tmp_path, fake_engine):
+        fake_engine.emit_on_start = False
+        app = make_app(self._fake(tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            app.screen._on_engine_event(
+                NoSwitchEvent(
+                    reason="warming-up", detail="2/3 accounts polled since start"
+                )
+            )
+            await pilot.pause()
+            assert (
+                "no switch: warming-up (2/3 accounts polled since start)"
+                in rendered(app, "#last-decision")
+            )
+
+    async def test_engine_warms_up_from_app_start(self, tmp_path, fake_engine):
+        fake_engine.emit_on_start = False
+        app = make_app(self._fake(tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("l")  # restart the engine (confirm go-live)
+            await pilot.pause()
+            await pilot.press("y")
+            await settle(pilot)
+            assert len(fake_engine.instances) == 2
+            # Both engines count from the app's start, not their own.
+            assert [e.warm_since for e in fake_engine.instances] == [
+                app.started_at,
+                app.started_at,
+            ]
 
     # -- threshold adjust ----------------------------------------------------------
 

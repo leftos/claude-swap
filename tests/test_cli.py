@@ -1059,11 +1059,12 @@ class TestAutoCommand:
         tick_outcome = None  # set per test (TickOutcome)
 
         def __init__(self, switcher, settings, on_event, *, dry_run=False,
-                     state_path=None, clock=None):
+                     state_path=None, clock=None, warm_since):
             self.switcher = switcher
             self.settings = settings
             self.on_event = on_event
             self.dry_run = dry_run
+            self.warm_since = warm_since
             type(self).instances.append(self)
 
         def tick(self):
@@ -1111,6 +1112,19 @@ class TestAutoCommand:
     def test_loop_mode_returns_loop_exit(self, temp_home):
         assert self._run([], temp_home) == 0
         assert self.FakeEngine.instances  # loop path constructed the engine
+
+    def test_loop_mode_warms_up_from_its_start(self, temp_home):
+        import time
+
+        before = time.time()
+        self._run([], temp_home)
+        warm_since = self.FakeEngine.instances[-1].warm_since
+        assert isinstance(warm_since, float)
+        assert before <= warm_since <= time.time()
+
+    def test_once_decides_without_warm_up(self, temp_home):
+        self._run(["--once"], temp_home)
+        assert self.FakeEngine.instances[-1].warm_since is None
 
     def test_flags_override_settings_json(self, temp_home):
         from claude_swap.paths import get_backup_root

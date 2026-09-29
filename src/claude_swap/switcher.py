@@ -1719,7 +1719,11 @@ class ClaudeAccountSwitcher:
         return self._usage_by_account()
 
     def usage_entries_by_account(
-        self, fetch: set[str] | None = None, *, scheduled: bool = False
+        self,
+        fetch: set[str] | None = None,
+        *,
+        scheduled: bool = False,
+        force: bool = False,
     ) -> dict[str, UsageEntry]:
         """Store-backed usage entries (ages, errors, poll state) per account.
 
@@ -1727,10 +1731,13 @@ class ClaudeAccountSwitcher:
         auto engine's scheduler); ``None`` means every stale account is
         eligible (on-demand callers). ``scheduled=True`` preserves valid
         future plans while still allowing due plans to beat the serve TTL.
+        ``force=True`` (the engine's start-up warm-up) fetches every member
+        of ``fetch`` regardless of freshness and poll plans; backoff, dead
+        tokens, holds and live claims still refuse.
         """
         accounts_info = self._build_accounts_info()
         return self._collect_usage_entries(
-            accounts_info, fetch=fetch, scheduled=scheduled
+            accounts_info, fetch=fetch, scheduled=scheduled, force=force
         )
 
     def accounts_snapshot(self, fetch: set[str] | None = None) -> AccountsSnapshot:
@@ -4952,6 +4959,7 @@ class ClaudeAccountSwitcher:
         fetch: set[str] | None = None,
         *,
         scheduled: bool = False,
+        force: bool = False,
     ) -> dict[str, UsageEntry]:
         """Store-backed usage collection: one :class:`UsageEntry` per account.
 
@@ -4960,8 +4968,9 @@ class ClaudeAccountSwitcher:
         the persisted poll plans; the auto engine passes an explicit set whose
         members may beat the serve TTL when their plan says so (urgent
         cadence) or, unless ``scheduled`` is set, when escalation needs them
-        fresh. Final eligibility —
-        freshness, backoff, claims, plans — is decided atomically by
+        fresh. ``force`` (with an explicit ``fetch``) drops the freshness and
+        plan gates for those members — the engine's start-up warm-up. Final
+        eligibility — freshness, backoff, claims, plans — is decided atomically by
         ``UsageStore.reserve``, so concurrent collectors can never
         double-fetch a slot. After each successful fetch the adapted cadence
         is persisted (``_persist_poll_plans``), making every surface inherit
@@ -5028,6 +5037,7 @@ class ClaudeAccountSwitcher:
                 identities,
                 respect_plans=False,
                 repair_overslept=scheduled,
+                force=force,
             )
         # An expired ACTIVE credential that cannot reach the fetch path (and
         # its locked refresh) this tick — failure backoff, a concurrent

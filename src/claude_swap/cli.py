@@ -712,11 +712,15 @@ Defaults live in settings.json in the backup root; flags override them.
                 sys.exit(1)
 
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
+        # The loop decides nothing until every account is polled since this
+        # start; a --once tick decides on whatever the store already holds.
+        warm_since = None if args.once else _time.time()
         engine = AutoSwitchEngine(
             switcher,
             settings,
             jsonl_emit if args.json else human_emit,
             dry_run=args.dry_run,
+            warm_since=warm_since,
         )
 
         if args.once:

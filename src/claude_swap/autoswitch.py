@@ -53,7 +53,11 @@ from claude_swap.poll_policy import (
 )
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
-from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
+from claude_swap.usage_store import (
+    UsageEntry,
+    due_candidate,
+    plan_oversleeps_interval,
+)
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
@@ -630,6 +634,46 @@ def _headroom_by_account(
     }
 
 
+def _polled_since(entry: UsageEntry | None, since: float, now: float) -> bool:
+    """Whether a fetch of this account has concluded at or after ``since``.
+
+    A successful reading counts, and so does a recorded failure: the attempt
+    was made, and its backoff now decides when the next one may run. A
+    failure whose row still carries a live claim is a concurrent collector
+    mid-fetch, not a concluded attempt.
+    """
+    if entry is None:
+        return False
+    if entry.fetched_at is not None and entry.fetched_at >= since:
+        return True
+    return (
+        entry.consecutive_failures > 0
+        and entry.last_attempt_at is not None
+        and entry.last_attempt_at >= since
+        and not entry.claimed(now)
+    )
+
+
+def _warm_settled(entry: UsageEntry | None, since: float, now: float) -> bool:
+    """Whether the warm-up gate has nothing left to wait for on this account.
+
+    Polled since ``since`` (:func:`_polled_since`), or unpollable right now —
+    failure backoff, a dead token, another machine's held reading, or a
+    sentinel (API-key account, expired token, ...). Waiting on those would
+    hold the gate for as long as they last, and no fetch can change them.
+    An account with no store entry at all has nothing to wait for either.
+    """
+    if entry is None:
+        return True
+    return (
+        _polled_since(entry, since, now)
+        or entry.sentinel is not None
+        or entry.in_backoff(now)
+        or entry.token_dead()
+        or entry.held(now)
+    )
+
+
 class AutoSwitchEngine:
     """Threshold-policy auto-switcher over a :class:`ClaudeAccountSwitcher`.
 
@@ -647,6 +691,7 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        warm_since: float | None,
     ):
         self.switcher = switcher
         self.settings = settings
@@ -684,6 +729,13 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # Warm-up gate (``warm_since`` on ``clock``'s timeline): the usage
+        # store can hold minutes-old readings at start, so no decision of any
+        # kind is made until every rotation account has been polled once
+        # since then (see ``_collect_warmup_usage``). Turned off for good on
+        # the tick that completes it; ``warm_since=None`` never turns it on.
+        self._warm_since = warm_since
+        self._warming = warm_since is not None
 
     # -- state file ---------------------------------------------------------
 
@@ -934,9 +986,20 @@ class AutoSwitchEngine:
             "email": "",
         }
 
-        entries, usage, headroom = self._collect_scheduled_usage(
-            current, quarantined, threshold=settings.threshold
-        )
+        warm_progress: tuple[int, int] | None = None
+        if self._warming:
+            entries, usage, headroom, warm_progress = self._collect_warmup_usage(
+                current, quarantined
+            )
+            if warm_progress[0] >= warm_progress[1]:
+                # Every account settled: this same tick decides on the
+                # entries just collected, and the gate never re-arms.
+                self._warming = False
+                warm_progress = None
+        else:
+            entries, usage, headroom = self._collect_scheduled_usage(
+                current, quarantined, threshold=settings.threshold
+            )
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -956,6 +1019,18 @@ class AutoSwitchEngine:
                 },
             )
         )
+
+        if warm_progress is not None:
+            # Still warming: no switch, quarantine, failover or idle-hold
+            # bookkeeping — just the progress, at the normal cadence.
+            settled, total = warm_progress
+            self._emit(
+                NoSwitchEvent(
+                    reason="warming-up",
+                    detail=f"{settled}/{total} accounts polled since start",
+                )
+            )
+            return TickOutcome.NO_ACTION
 
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
@@ -1951,6 +2026,45 @@ class AutoSwitchEngine:
         return [num for _, num in qualifying], any_known, active_reset_ts
 
     # -- adaptive usage scheduling ---------------------------------------------
+
+    def _collect_warmup_usage(
+        self, current: str, quarantined: set[str]
+    ) -> tuple[
+        dict, dict[str, dict | str | None], dict[str, float | None], tuple[int, int]
+    ]:
+        """Warm-up collection: fetch every account not yet polled since start.
+
+        The members are the active account plus every non-quarantined
+        switchable candidate. Each one without a concluded fetch since
+        ``warm_since`` is nominated for a forced fetch that ignores the serve
+        TTL and poll plans; the store still refuses backoff, dead tokens,
+        holds and live claims, and a successful fetch records its plan as
+        usual. No idle-hold or escalation logic runs here — nothing is
+        decided while warming.
+
+        Returns ``(entries, usage, headroom, (settled, total))``, settled
+        judged by :func:`_warm_settled` on the entries just collected.
+        """
+        assert self._warm_since is not None
+        warm_since = self._warm_since
+        members = [current] + [
+            n
+            for n in self.switcher.switchable_account_numbers()
+            if n != current and n not in quarantined
+        ]
+        pre = self.switcher.usage_entries_by_account(fetch=set())
+        now = self.clock()
+        pending = {
+            n for n in members if not _polled_since(pre.get(n), warm_since, now)
+        }
+        entries = self.switcher.usage_entries_by_account(fetch=pending, force=True)
+        now = self.clock()
+        settled = sum(
+            1 for n in members if _warm_settled(entries.get(n), warm_since, now)
+        )
+        usage = {num: entry.decision_value() for num, entry in entries.items()}
+        headroom = _headroom_by_account(usage, self._models)
+        return entries, usage, headroom, (settled, len(members))
 
     def _collect_scheduled_usage(
         self,
