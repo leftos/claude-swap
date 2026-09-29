@@ -1242,6 +1242,7 @@ def no_live_screen(monkeypatch):
         pass
 
     monkeypatch.setattr("claude_swap.tui.app.LiveScreen", _InertScreen)
+    monkeypatch.setattr("claude_swap.tui.app.CswapApp.STORE_ONLY_AT_BOOT", False)
 
 
 async def wait_for(pilot, condition, timeout: float = 2.0) -> None:
@@ -1348,6 +1349,16 @@ class TestLiveScreen:
         )
 
     # -- boot, navigation, lifecycle -----------------------------------------
+
+    async def test_boot_poller_never_fetches(self, tmp_path, fake_engine):
+        """The engine's warm-up is the only fetcher at boot: a fetching app
+        refresh would claim the same accounts and delay its first decision."""
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            assert fake.fetch_sets
+            assert all(fetch == set() for fetch in fake.fetch_sets)
 
     async def test_boot_opens_live_screen_over_dashboard(self, tmp_path, fake_engine):
         from claude_swap.tui.autoview import LiveScreen

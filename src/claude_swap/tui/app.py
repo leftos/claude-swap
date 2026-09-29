@@ -45,6 +45,11 @@ class CswapApp(App):
     # keeps format_duration in whole minutes, so the note never ticks per
     # second.
     SNAPSHOT_AGE_NOTE_S = 60.0
+    # The app opens on the live screen, whose engine is the only fetcher, so
+    # the poller starts store-only. A fetching first refresh would race the
+    # engine's warm-up fetch for the same accounts and delay its first
+    # decision by a whole interval.
+    STORE_ONLY_AT_BOOT = True
 
     snapshot: reactive[AccountsSnapshot | None] = reactive(None)
     refresh_status: reactive[str] = reactive("")
@@ -62,7 +67,7 @@ class CswapApp(App):
         self.switcher = switcher
         self._detected = detected  # terminal background sensed pre-driver, or None
         self.source = SnapshotSource(switcher)
-        self._store_only = False
+        self._store_only = self.STORE_ONLY_AT_BOOT
         self._full_next = False
         self._normal_refreshing = False
         self._store_refreshing = False
