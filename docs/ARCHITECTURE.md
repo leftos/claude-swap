@@ -2,7 +2,7 @@
 
 claude-swap is a single Python package (`src/claude_swap/`, installed as `cswap` and `claude-swap`) that switches Claude Code between stored accounts, watches their usage, and can switch for you before a rate limit. Layers: OS and storage primitives (`paths`, `fsutil`, `locking`, `claude_locks`, `macos_keychain`, `credentials`) → usage and account state (`oauth`, `usage_store`, `poll_policy`, `pace`, `models`, `settings`) → orchestration (`switcher.ClaudeAccountSwitcher`, `session`, `transfer`, `mappings`) → engine (`autoswitch`) → frontends (`cli`, `tui/`, `menubar`). The rule that shapes it: `ClaudeAccountSwitcher` owns account orchestration, the frontends are thin shells over it and over `AutoSwitchEngine`, and the engine and the storage leaves never import a frontend.
 
-The repo has no `docs/` folder and no `CLAUDE.md`; module docstrings and `README.md` are the deep docs.
+This file is the only doc under `docs/`; `CLAUDE.md` holds the dev commands and contributor rules, and module docstrings and `README.md` are the deep docs.
 
 ## Task Index
 
@@ -66,7 +66,7 @@ A new test goes in the file for the module it exercises; CI (`.github/workflows/
 
 ## Deep docs
 
-There is no `docs/` folder. The deep detail lives in these places:
+There are no subsystem docs under `docs/`. The deep detail lives in these places:
 
 - [`README.md`](../README.md): user-facing behaviour of every command, the JSON contract, data locations.
 - Module docstrings at the top of `credentials.py`, `autoswitch.py`, `usage_store.py`, `poll_policy.py`, `claude_locks.py`, `session.py`, `migrations.py` and `tui/__init__.py`: the contracts and locking protocols for each module.
