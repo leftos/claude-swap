@@ -216,6 +216,8 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 
 ## How it works
 
+The architecture entry point is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): Task Index, layers, integration footguns, test locations and the deep docs.
+
 - Backs up OAuth tokens and config when you add an account
 - Swaps only the account-specific Claude login when you switch accounts;
   live account-independent OAuth state (such as MCP server logins) is
