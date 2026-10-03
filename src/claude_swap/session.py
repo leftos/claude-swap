@@ -695,14 +695,15 @@ class SessionManager:
             return session_dir, account_num, email
 
         # One refresh so the profile starts with a fresh access token —
-        # BEFORE the bootstrap lock (the gate takes the same non-reentrant
-        # FileLock and POSTs over the network, which must never run under a
-        # held lock). The gate re-reads the freshest copy itself and
-        # persists via fingerprint CAS; _bootstrap then reads the rotated
-        # backup. Failure is non-fatal: the stored token may still be
-        # valid, and claude refreshes on its own at runtime. Setup-token
-        # accounts (--add-token) have no refresh token by design — skip
-        # silently instead of warning about a flow that can't happen.
+        # BEFORE the bootstrap locks (the gate takes the same non-reentrant
+        # consume lock and account lock, and POSTs over the network, which
+        # must never run under a held lock). The gate re-reads the freshest
+        # copy itself and persists via fingerprint CAS; _bootstrap then
+        # reads the rotated backup. Failure is non-fatal: the stored token
+        # may still be valid, and claude refreshes on its own at runtime.
+        # Setup-token accounts (--add-token) have no refresh token by
+        # design — skip silently instead of warning about a flow that
+        # can't happen.
         pre_creds = self.switcher.read_account_credentials(account_num, email)
         if pre_creds and self._has_refresh_token(pre_creds):
             outcome = self.switcher.consume_backup_grant(
@@ -762,7 +763,17 @@ class SessionManager:
                     "continuing with the stored credentials."
                 )
 
-        with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+        # Consume lock first, then the account lock, matching the gate's
+        # order and preventing deadlock. Holding the consume lock across the
+        # bootstrap keeps a backup-grant spend for this slot from
+        # overlapping the copy of the backup into the profile.
+        with (
+            FileLock(
+                self.switcher.credentials_dir / f".consume-{account_num}.lock",
+                timeout=_BOOTSTRAP_LOCK_TIMEOUT,
+            ),
+            FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT),
+        ):
             # Re-evaluate the marker under the lock, then re-check validity:
             # another `cswap run` may have bootstrapped while we waited.
             if is_session_stale(session_dir) and profile_is_quiescent(session_dir):
@@ -830,7 +841,7 @@ class SessionManager:
                     f"validation. Log in with that account and re-add it: "
                     f"cswap --add-account --slot {account_num}"
                 )
-        # Lock released here, before any exec.
+        # Locks released here, before any exec.
 
         return session_dir, account_num, email
 
@@ -860,7 +871,10 @@ class SessionManager:
     def _bootstrap(
         self, session_dir: Path, account_num: str, email: str, org_uuid: str
     ) -> None:
-        """Seed the session profile from backup storage. Caller holds the lock."""
+        """Seed the session profile from backup storage.
+
+        Caller holds the slot's consume lock and the account lock.
+        """
         # Claude reads the keychain before the plaintext file — a stale hashed
         # entry from an earlier profile at this path would shadow the seed.
         delete_macos_keychain_entry(session_dir)

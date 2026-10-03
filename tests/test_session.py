@@ -20,10 +20,12 @@ from claude_swap.credentials import CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE
 from claude_swap.exceptions import (
     AccountNotFoundError,
     CredentialReadError,
+    LockError,
     SessionError,
     SwitchError,
     ValidationError,
 )
+from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.paths import get_global_config_path
 from claude_swap.session import (
@@ -567,6 +569,53 @@ class TestBootstrap:
         merged = json.loads((session_dir / ".claude.json").read_text())
         assert merged["projects"] == {"/some/project": {"history": ["x"]}}
         assert merged["oauthAccount"]["emailAddress"] == ACCOUNT_EMAIL
+
+    def test_bootstrap_waits_for_a_consume_in_flight(
+        self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates,
+        monkeypatch,
+    ):
+        consume_lock = FileLock(
+            seeded_switcher.credentials_dir / f".consume-{ACCOUNT_NUM}.lock"
+        )
+        assert consume_lock.acquire()
+        monkeypatch.setattr(session_mod, "_BOOTSTRAP_LOCK_TIMEOUT", 0.3)
+        try:
+            with pytest.raises(LockError):
+                manager.setup_session("2", share=False)
+        finally:
+            consume_lock.release()
+
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        assert not (session_dir / ".credentials.json").exists()
+
+    def test_bootstrap_holds_the_consume_lock_while_seeding(
+        self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates,
+        monkeypatch,
+    ):
+        consume_path = (
+            seeded_switcher.credentials_dir / f".consume-{ACCOUNT_NUM}.lock"
+        )
+        held_during_bootstrap: list[bool] = []
+        original = SessionManager._bootstrap
+
+        def probe(self, *args, **kwargs):
+            probe_lock = FileLock(consume_path)
+            held = not probe_lock.acquire(timeout=0)
+            held_during_bootstrap.append(held)
+            if not held:
+                probe_lock.release()
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(SessionManager, "_bootstrap", probe)
+
+        manager.setup_session("2", share=False)
+
+        assert held_during_bootstrap == [True]
+        after = FileLock(consume_path)
+        assert after.acquire(timeout=0)
+        after.release()
 
 
 # ---------------------------------------------------------------------------

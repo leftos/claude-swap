@@ -49,6 +49,7 @@ All modules live in `src/claude_swap/`. Imports are absolute (`from claude_swap 
 - **Change the usage-store file shape** → bump `SCHEMA_VERSION` (currently 2) or `HISTORY_SCHEMA_VERSION` in `usage_store.py`; a file with a different version is read as empty.
 - **Change engine events** → `cli.py` (`_auto_command` renders them as lines or JSONL), `tui/autoview.py` and `menubar.py` all consume the same stream; the `--json` event stream is additive by contract.
 - **Change credential storage** → `tests/test_macos_keychain_contract.py` pins the `(service, account)` tuple the macOS backup path passes to `macos_keychain`; its real-keychain layer runs only on GitHub Actions macOS.
+- **Read a slot's backup credential to copy it somewhere** → hold that slot's consume lock (`credentials/.consume-<n>.lock`) across the copy, taken before the account lock (`.lock` in the backup root), the order `switcher.consume_backup_grant` and `_fetch_active_usage` use; `session.setup_session` does this for `_bootstrap`. Without it, a copy that runs while a gate's POST is in flight hands out the grant being spent. `FileLock` is not re-entrant, so never call the gate while holding the consume lock.
 - **Write tests that touch account storage** → `tests/conftest.py` installs a process-global audit hook (`RealStoreWriteBlocked`) that refuses writes to the real account store, and `tests/test_real_store_guard.py` tests it. A test that builds a switcher without `temp_home` will trip it.
 
 ## Test locations
