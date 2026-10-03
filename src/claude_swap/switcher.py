@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import logging
@@ -114,6 +115,12 @@ _FETCH_STAGGER_S = 0.25
 # serve TTL the data is current by design (that is the polling cadence), so
 # an age note there would be permanent noise.
 _USAGE_AGE_NOTE_S = poll_policy.SERVE_TTL_S
+
+# A switch takes the target slot's consume lock so it never races the gate's
+# spend of that slot's backup grant. The gate holds the lock across a refresh
+# POST bounded at 10 s, so a switch waits out one in-flight refresh rather
+# than failing on it.
+_SWITCH_CONSUME_LOCK_TIMEOUT = 30.0
 
 
 def _pace_marker(window: dict, fetched_at: float | None) -> str:
@@ -6699,6 +6706,31 @@ class ClaudeAccountSwitcher:
             "or run from a normal shell."
         )
 
+    @contextlib.contextmanager
+    def _switch_consume_lock(self, account_num: str):
+        """Hold the target slot's consume lock for the switch's mutation span.
+
+        A backup-grant spend for the target (``consume_backup_grant``) holds
+        this same lock across re-read → POST → persist, so a switch that copies
+        the target's backup into the live store can never overlap the POST that
+        spends it. It is taken before cswap's ``lock_file`` and Claude Code's
+        locks — the gate's order, the only one that cannot deadlock. On timeout
+        the switch fails before any mutation.
+        """
+        lock = FileLock(
+            self.credentials_dir / f".consume-{account_num}.lock",
+            _SWITCH_CONSUME_LOCK_TIMEOUT,
+        )
+        if not lock.acquire():
+            raise LockError(
+                f"Account-{account_num}'s login is being refreshed right now; "
+                "retry the switch in a few seconds."
+            )
+        try:
+            yield
+        finally:
+            lock.release()
+
     def _perform_switch(
         self,
         target_account: str,
@@ -6797,7 +6829,10 @@ class ClaudeAccountSwitcher:
         # ~/.claude.json.lock likewise keeps the oauthAccount splice from
         # interleaving with Claude Code's own config writes. Everything under
         # here is local I/O — no network while locks are held.
-        with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+        # The target's consume lock comes first — the gate's order — so a
+        # backup-grant spend for the target never overlaps its copy into the
+        # live store.
+        with self._switch_consume_lock(target_account), FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None

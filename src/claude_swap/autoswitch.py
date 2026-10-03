@@ -2234,8 +2234,8 @@ class AutoSwitchEngine:
         # sequence so two concurrent engines (loop + cron --once) make one
         # serialized decision: the loser re-reads the winner's lastSwitchAt
         # and backs off instead of double-switching. No deadlock cycle: the
-        # switch path (cswap FileLock + Claude Code locks) never takes the
-        # state lock.
+        # switch path (the target's consume lock + cswap FileLock + Claude
+        # Code locks) never takes the state lock.
         with self._state_lock():
             state = self._read_state()
             if trigger in ("proactive", "consume-first") and self._in_cooldown(state):

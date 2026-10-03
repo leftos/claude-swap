@@ -6,8 +6,8 @@ This fork's work queue. Upstream (`realiti4/claude-swap`) issues and PRs are not
 
 ## Current focus
 
-- [ ] Take the consume lock in `_perform_switch`, so a `cswap switch` never lands the live store on a backup grant being spent (ops-tower request, OPS-82 follow-up). `_perform_switch` (`switcher.py:6702`) copies the target's backup into the live store at `switcher.py:6915` and `:7192` (`:6980` is the rollback write) without `credentials/.consume-<target>.lock`, which cswap takes only at `switcher.py:2084`, `:4285` and in `session.py` `setup_session`. A switch to account N while a consume gate's POST for N is in flight leaves Claude Code holding the refresh token being spent, so its next refresh reuses a spent grant. Take that lock before the copy to the live store, before the account lock (the gate's order).
-
 ## Next up
 
 ## Backlog
+
+- [ ] Fix a stale line citation in a `_perform_switch` comment: `switcher.py:7243` says the direct activation branch is at `(:6148-6165)`, but it now starts at the `force_activate` branch near `switcher.py:6820`. Name the branch instead of citing line numbers.

@@ -6097,6 +6097,85 @@ class TestClaudeCodeLockCooperation:
         # The holder's lock was left alone.
         assert (temp_home / ".claude.lock").is_dir()
 
+    def test_switch_waits_for_a_consume_in_flight(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A switch to a target whose grant is being spent must not race it.
+
+        ``consume_backup_grant`` holds the target's ``.consume-N.lock`` across
+        re-read → POST → persist, so a switch that copies that slot's backup
+        into the live store while the POST is in flight would activate the
+        grant the gate is spending. The switch takes the same lock, so with it
+        held it times out before any mutation and asks the user to retry.
+        """
+        from claude_swap.exceptions import LockError
+        from claude_swap.locking import FileLock
+
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        monkeypatch.setattr(
+            "claude_swap.switcher._SWITCH_CONSUME_LOCK_TIMEOUT", 0.3
+        )
+        live_creds_path = temp_home / ".claude" / ".credentials.json"
+        live_creds_before = live_creds_path.read_text()
+
+        holder = FileLock(s.credentials_dir / ".consume-2.lock")
+        assert holder.acquire(), "could not seed the contended lock"
+        try:
+            with pytest.raises(LockError) as excinfo:
+                s.switch_to("2")
+        finally:
+            holder.release()
+
+        assert "Account-2's login is being refreshed right now" in str(
+            excinfo.value
+        )
+        # Nothing was mutated: the consume lock is taken before any write.
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        assert live_creds_path.read_text() == live_creds_before
+
+    def test_switch_holds_the_target_consume_lock_at_write_time(
+        self, temp_home: Path
+    ):
+        """Every live-store write of the switch runs under the target's
+        consume lock, so the ongoing grant spend cannot overlap the copy."""
+        from claude_swap.locking import FileLock
+
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        consume_path = s.credentials_dir / ".consume-2.lock"
+        held_at_write: list[bool] = []
+        original_write = s._write_credentials
+
+        def spying_write(credentials: str) -> None:
+            probe = FileLock(consume_path)
+            held = not probe.acquire(timeout=0)
+            if not held:
+                probe.release()
+            held_at_write.append(held)
+            original_write(credentials)
+
+        with patch.object(s, "_write_credentials", side_effect=spying_write), \
+             patch.object(s, "list_accounts"):
+            s.switch_to("2")
+
+        assert held_at_write, "the switch must write the live credentials"
+        assert all(held_at_write), (
+            "the target's consume lock must be held at every write: a grant "
+            "spend for the target could otherwise copy over the live store "
+            "mid-POST"
+        )
+        # Released after the switch.
+        released_probe = FileLock(consume_path)
+        assert released_probe.acquire(timeout=0)
+        released_probe.release()
+
 
 class TestMacosKeychainFallback:
     """macOS auto-fallback to file storage when the Keychain is unusable, plus the
