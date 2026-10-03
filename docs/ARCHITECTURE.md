@@ -2,7 +2,7 @@
 
 claude-swap is a single Python package (`src/claude_swap/`, installed as `cswap` and `claude-swap`) that switches Claude Code between stored accounts, watches their usage, and can switch for you before a rate limit. Layers: OS and storage primitives (`paths`, `fsutil`, `locking`, `claude_locks`, `macos_keychain`, `credentials`) → usage and account state (`oauth`, `usage_store`, `poll_policy`, `pace`, `models`, `settings`) → orchestration (`switcher.ClaudeAccountSwitcher`, `session`, `transfer`, `mappings`) → engine (`autoswitch`) → frontends (`cli`, `tui/`, `menubar`). The rule that shapes it: `ClaudeAccountSwitcher` owns account orchestration, the frontends are thin shells over it and over `AutoSwitchEngine`, and the engine and the storage leaves never import a frontend.
 
-This file is the only doc under `docs/`; `CLAUDE.md` holds the dev commands and contributor rules, and module docstrings and `README.md` are the deep docs.
+[`docs/README.md`](README.md) is the docs start page (this file, the plan, the glossary); `CLAUDE.md` holds the dev commands and contributor rules, and module docstrings and `README.md` are the deep docs.
 
 ## Task Index
 
